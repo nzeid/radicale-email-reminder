@@ -21,6 +21,8 @@ import re
 import html
 import uuid
 import quopri
+import socket
+import ipaddress
 from smtplib import SMTP
 from email.utils import parseaddr
 from email.utils import formataddr
@@ -30,9 +32,16 @@ import dateutil.rrule
 from email.header import Header
 
 def initialize_smtp_object(mail_server_host, mail_server_port):
+  mail_server_is_loopback = socket.getaddrinfo(host=mail_server_host, port=mail_server_port, proto=socket.IPPROTO_TCP)
+  if(len(mail_server_is_loopback)):
+    mail_server_is_loopback = mail_server_is_loopback[0][4][0]
+    mail_server_is_loopback = ipaddress.ip_address(mail_server_is_loopback)
+    mail_server_is_loopback = mail_server_is_loopback.is_loopback
+  else:
+    mail_server_is_loopback = False
   smtp_object = SMTP(host=mail_server_host, port=mail_server_port, timeout=10)
   smtp_object.ehlo_or_helo_if_needed()
-  if(smtp_object.has_extn("starttls")):
+  if((not mail_server_is_loopback) and smtp_object.has_extn("starttls")):
     smtp_object.starttls()
   return smtp_object
 
@@ -77,7 +86,10 @@ def send_email(email_addresses, email_content, smtp_object, from_address, report
   the_rest += "Content-Type: text/plain; charset=utf-8\r\n"
   the_rest += "Content-Transfer-Encoding: quoted-printable\r\n\r\n"
   a_body = "Summary:\n\n" + email_content["summary"] + "\n\n"
-  a_body += "Time:\n\n" + email_content["start_time"] + "\n\n"
+  a_body += "Time:\n\n" + email_content["start_time"]
+  if(len(email_content["end_time"])):
+    a_body += "   to   " + email_content["end_time"]
+  a_body += "\n\n"
   if(len(email_content["location"])):
     a_body += "Location:\n\n" + email_content["location"] + "\n\n"
   if(len(email_content["description"])):
@@ -91,7 +103,10 @@ def send_email(email_addresses, email_content, smtp_object, from_address, report
   a_body += "<head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" /><title>" + html.escape(email_content["subject"]) + "</title></head>\n"
   a_body += "<body>\n"
   a_body += "<div>Summary:</div><ul><li style=\"white-space: pre;\">" + html.escape(email_content["summary"]) + "</li></ul>\n"
-  a_body += "<div>Time:</div><ul><li style=\"white-space: pre;\">" + html.escape(email_content["start_time"]) + "</li></ul>\n"
+  a_body += "<div>Time:</div><ul><li style=\"white-space: pre;\">" + html.escape(email_content["start_time"])
+  if(len(email_content["end_time"])):
+    a_body += "&nbsp;&nbsp;&nbsp;to&nbsp;&nbsp;&nbsp;" + html.escape(email_content["end_time"])
+  a_body += "</li></ul>\n"
   if(len(email_content["location"])):
     a_body += "<div>Location:</div><ul><li style=\"white-space: pre;\">" + html.escape(email_content["location"]) + "</li></ul>\n"
   if(len(email_content["description"])):
@@ -112,26 +127,58 @@ def send_email(email_addresses, email_content, smtp_object, from_address, report
     report["emails_sent"] += 1
   return
 
-def process_alarm_object(alarm_object, stamp_object, start_object, rrule_object, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, report):
+def process_alarm_object(alarm_object, stamp_object, start_object, duration_object, end_object, rrule_object, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, regex_list, report):
   # print(alarm_object.to_ical().decode("utf-8"))
   start_time = None
+  all_day = False
   if(isinstance(start_object, prop.vDDDTypes)):
     if(isinstance(start_object.dt, datetime.datetime)):
       start_time = start_object.dt
     else:
       start_time = datetime.datetime(year=start_object.dt.year, month=start_object.dt.month, day=start_object.dt.day, tzinfo=stamp_object.dt.tzinfo)
+      all_day = True
   else:
     start_time = stamp_object.dt
   if(start_time.tzinfo is None):
     start_time = start_time.replace(tzinfo=stamp_object.dt.tzinfo)
+  duration = None
+  if(isinstance(duration_object, prop.vDDDTypes)):
+    if(isinstance(duration_object.dt, datetime.timedelta)):
+      duration = duration_object.dt
+  elif(isinstance(end_object, prop.vDDDTypes)):
+    if(isinstance(end_object.dt, datetime.datetime)):
+      duration = end_object.dt - start_time
+    else:
+      duration = datetime.datetime(year=end_object.dt.year, month=end_object.dt.month, day=end_object.dt.day, tzinfo=start_time.tzinfo) - start_time
   if(isinstance(rrule_object, prop.vRecur)):
+    start_time_tz = start_time.tzinfo
+    start_time_dst = start_time.dst()
+    start_time = start_time.astimezone(email_start_time.tzinfo)
     rrule = dateutil.rrule.rrulestr(rrule_object.to_ical().decode('utf-8'), dtstart=start_time)
     start_time = rrule.after(email_start_time)
-    if(not isinstance(start_time, datetime.datetime)):
+    if(isinstance(start_time, datetime.datetime)):
+      start_time = start_time.astimezone(start_time_tz)
+      start_time += start_time_dst - start_time.dst()
+    else:
       report["alarms_expired"] += 1
       return
-  email_content["start_time"] = start_time.strftime("%a %b %d, %Y %I:%M%p %Z")
-  email_content["start_time"] = email_content["start_time"].replace(" 0", " ")
+  end_time = None
+  if(isinstance(duration, datetime.timedelta)):
+    end_time = start_time + duration
+  email_content["end_time"] = ""
+  if(all_day):
+    email_content["start_time"] = start_time.strftime("%a %b %d, %Y")
+    if(isinstance(end_time, datetime.datetime)):
+      email_content["end_time"] = (end_time.date() - datetime.timedelta(days=1)).strftime("%a %b %d, %Y")
+      if(email_content["start_time"] == email_content["end_time"]):
+        email_content["end_time"] = ""
+  else:
+    email_content["start_time"] = start_time.strftime("%a %b %d, %Y %I:%M%p %Z").replace(" 0", " ")
+    if(isinstance(end_time, datetime.datetime)):
+      if(end_time.year == start_time.year and end_time.month == start_time.month and end_time.day == start_time.day):
+        email_content["start_time"] = regex_list["end_time_injector"].sub(end_time.strftime("-%I:%M%p %Z").replace("-0", "-"), email_content["start_time"])
+      else:
+        email_content["end_time"] = end_time.strftime("%a %b %d, %Y %I:%M%p %Z").replace(" 0", " ")
   alarm_time = alarm_object["TRIGGER"].dt
   if(isinstance(alarm_time, datetime.datetime)):
     if(alarm_time.tzinfo is None):
@@ -156,6 +203,8 @@ def process_calendar_object(calendar_object, email_start_time, minutes_ahead, sm
     # print(event_object.to_ical().decode("utf-8"))
     stamp_object = event_object["DTSTAMP"]
     start_object = event_object["DTSTART"] if event_object.has_key("DTSTART") else None
+    duration_object = event_object["DURATION"] if event_object.has_key("DURATION") else None
+    end_object = event_object["DTEND"] if event_object.has_key("DTEND") else None
     rrule_object = event_object["RRULE"] if event_object.has_key("RRULE") else None
     email_content = get_email_content(event_object)
     email_addresses = []
@@ -164,7 +213,7 @@ def process_calendar_object(calendar_object, email_start_time, minutes_ahead, sm
     trim_email_content(email_content, regex_list)
     for alarm_object in event_object.walk('valarm'):
       report["event_alarms"] += 1
-      process_alarm_object(alarm_object, stamp_object, start_object, rrule_object, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, report)
+      process_alarm_object(alarm_object, stamp_object, start_object, duration_object, end_object, rrule_object, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, regex_list, report)
   for todo_object in calendar_object.walk('vtodo'):
     # print(todo_object.to_ical().decode("utf-8"))
     stamp_object = todo_object["DTSTAMP"]
@@ -175,7 +224,7 @@ def process_calendar_object(calendar_object, email_start_time, minutes_ahead, sm
     trim_email_content(email_content, regex_list)
     for alarm_object in todo_object.walk('valarm'):
       report["todo_alarms"] += 1
-      process_alarm_object(alarm_object, stamp_object, None, None, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, report)
+      process_alarm_object(alarm_object, stamp_object, None, None, None, None, email_addresses, email_content, email_start_time, minutes_ahead, smtp_object, from_address, regex_list, report)
   return
 
 def process_calendar_file(calendar_file, email_start_time, minutes_ahead, smtp_object, from_address, regex_list, report):
@@ -221,6 +270,7 @@ def process_calendar_directory(calendar_directory, minutes_ahead, mail_server_ho
     "whitespace_clobber": re.compile("\\s+", re.S|re.U),
     "first_email_split": re.compile("^[^\\S\\r\\n]*[Nn][Oo][Tt][Ii][Ff][Yy]:[^\\S\\r\\n]*(\\r\\n|\\r|\\n)(.+?)(\\r\\n|\\r|\\n)-", re.S|re.U),
     "second_email_split": re.compile("\\s*\\r\\s*|\\s*\\n\\s*", re.S|re.U),
+    "end_time_injector": re.compile(" [A-Za-z0-9]+$", re.S|re.U)
   }
   smtp_object = initialize_smtp_object(mail_server_host, mail_server_port)
   for root, dirs, files in os.walk(calendar_directory):
@@ -231,10 +281,12 @@ def process_calendar_directory(calendar_directory, minutes_ahead, mail_server_ho
         gc.collect()
   return
 
+this_version = "1.1.0"
 if(len(sys.argv) != 6):
-  print(os.path.basename(__file__) + ": Missing operands!\n" + os.path.basename(__file__) + " <directory> <minutes ahead> <mail server host> <mail server port> <from address>", file=sys.stderr)
+  print(os.path.basename(__file__) + " (v" + this_version + "): Missing operands!\n" + os.path.basename(__file__) + " <directory> <minutes ahead> <mail server host> <mail server port> <from address>", file=sys.stderr)
   exit(1)
 report = {
+  "version": this_version,
   "calendar_files": 0,
   "calendar_file_access_errors": 0,
   "calendar_file_format_errors": 0,
